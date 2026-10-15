@@ -1078,12 +1078,16 @@ impl TerminalBuilder {
             path_style,
             cwd_history: Vec::new(),
             pending_cwd_boundary: None,
+            pending_pty_resize: None,
+            pty_resize_task: None,
             #[cfg(any(test, feature = "test-support"))]
             input_log: Vec::new(),
             #[cfg(test)]
             suppress_hyperlink_throttle_once: false,
             #[cfg(any(test, feature = "test-support"))]
             pty_write_log: Default::default(),
+            #[cfg(any(test, feature = "test-support"))]
+            pty_resize_log: Default::default(),
         };
 
         TerminalBuilder {
@@ -1380,12 +1384,16 @@ impl TerminalBuilder {
                         .unwrap_or_default()
                 },
                 pending_cwd_boundary: None,
+                pending_pty_resize: None,
+                pty_resize_task: None,
                 #[cfg(any(test, feature = "test-support"))]
                 input_log: Vec::new(),
                 #[cfg(test)]
                 suppress_hyperlink_throttle_once: false,
                 #[cfg(any(test, feature = "test-support"))]
                 pty_write_log: Default::default(),
+                #[cfg(any(test, feature = "test-support"))]
+                pty_resize_log: Default::default(),
             };
 
             if !activation_script.is_empty() && no_task {
@@ -1565,12 +1573,18 @@ pub struct Terminal {
     path_style: PathStyle,
     cwd_history: Vec<CwdHistoryEntry>,
     pending_cwd_boundary: Option<i32>,
+    /// final bounds awaiting the debounced PTY winsize update.
+    pending_pty_resize: Option<TerminalBounds>,
+    /// debounce timer for PTY winsize; dropping the task cancels it.
+    pty_resize_task: Option<Task<()>>,
     #[cfg(any(test, feature = "test-support"))]
     input_log: Vec<Vec<u8>>,
     #[cfg(test)]
     suppress_hyperlink_throttle_once: bool,
     #[cfg(any(test, feature = "test-support"))]
     pty_write_log: std::cell::RefCell<Vec<Vec<u8>>>,
+    #[cfg(any(test, feature = "test-support"))]
+    pty_resize_log: std::cell::RefCell<Vec<TerminalBounds>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1629,6 +1643,8 @@ impl TaskStatus {
 
 const FIND_HYPERLINK_THROTTLE_PX: Pixels = px(5.0);
 const FIND_HYPERLINK_THROTTLE: Duration = Duration::from_millis(100);
+/// Delay before notifying the PTY of a new winsize after the last grid resize.
+const PTY_RESIZE_DEBOUNCE: Duration = Duration::from_millis(150);
 
 /// Minimum pointer movement before a left click begins a selection. This keeps
 /// a click that jitters by a pixel or two (such as the window-focusing click)
@@ -1742,19 +1758,13 @@ impl Terminal {
                 let new_bounds = normalize_terminal_bounds(new_bounds);
                 trace!("Resizing: new_bounds={new_bounds:?}");
 
-                let columns_changed =
-                    self.last_content.terminal_bounds.num_columns() != new_bounds.num_columns();
+                // `set_size` already wrote the new bounds into `last_content`, so
+                // compare against the live grid to detect a column change.
+                let columns_changed = term.columns() != new_bounds.num_columns();
                 self.last_content.terminal_bounds = new_bounds;
 
-                if let TerminalType::Pty {
-                    resources: PtyResources::Active(pty_tx),
-                    ..
-                } = &self.terminal_type
-                {
-                    pty_tx.resize(new_bounds);
-                }
-
                 resize(term, new_bounds);
+                self.schedule_pty_resize(new_bounds, cx);
                 if columns_changed {
                     self.reset_cwd_history();
                 }
@@ -2192,6 +2202,35 @@ impl Terminal {
         }
     }
 
+    /// debounce PTY winsize updates
+    /// SIGWINCH while the grid is still reflowing every frame, the grid itself is resized immediately
+    fn schedule_pty_resize(&mut self, new_bounds: TerminalBounds, cx: &mut Context<Self>) {
+        self.pending_pty_resize = Some(new_bounds);
+        // drop the previous timer; a new frame restarts the debounce window.
+        self.pty_resize_task = None;
+
+        let this = cx.weak_entity();
+        self.pty_resize_task = Some(cx.spawn(async move |cx| {
+            cx.background_executor().timer(PTY_RESIZE_DEBOUNCE).await;
+            this.update(cx, |terminal, cx| {
+                terminal.pty_resize_task = None;
+                let Some(bounds) = terminal.pending_pty_resize.take() else {
+                    return;
+                };
+                if let TerminalType::Pty {
+                    resources: PtyResources::Active(pty_tx),
+                    ..
+                } = &terminal.terminal_type
+                {
+                    pty_tx.resize(bounds);
+                    #[cfg(any(test, feature = "test-support"))]
+                    terminal.pty_resize_log.borrow_mut().push(bounds);
+                }
+            })
+            .ok();
+        }));
+    }
+
     /// Write the Input payload to the PTY, if applicable.
     /// (This is a no-op for display-only terminals.)
     fn write_to_pty(&self, input: impl Into<Cow<'static, [u8]>>) {
@@ -2346,6 +2385,11 @@ impl Terminal {
     #[cfg(any(test, feature = "test-support"))]
     pub fn take_pty_write_log(&mut self) -> Vec<Vec<u8>> {
         std::mem::take(self.pty_write_log.get_mut())
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn take_pty_resize_log(&mut self) -> Vec<TerminalBounds> {
+        std::mem::take(self.pty_resize_log.get_mut())
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -3155,6 +3199,8 @@ impl Terminal {
     ///
     /// Calling this method after the resources have already been released is a no-op.
     pub fn release_pty_resources(&mut self) {
+        self.pty_resize_task = None;
+        self.pending_pty_resize = None;
         let TerminalType::Pty { resources, info } = &mut self.terminal_type else {
             return;
         };
