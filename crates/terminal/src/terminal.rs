@@ -1079,6 +1079,7 @@ impl TerminalBuilder {
             cwd_history: Vec::new(),
             pending_cwd_boundary: None,
             pending_pty_resize: None,
+            last_pty_resize_sent: None,
             pty_resize_task: None,
             #[cfg(any(test, feature = "test-support"))]
             input_log: Vec::new(),
@@ -1385,6 +1386,7 @@ impl TerminalBuilder {
                 },
                 pending_cwd_boundary: None,
                 pending_pty_resize: None,
+                last_pty_resize_sent: None,
                 pty_resize_task: None,
                 #[cfg(any(test, feature = "test-support"))]
                 input_log: Vec::new(),
@@ -1575,6 +1577,8 @@ pub struct Terminal {
     pending_cwd_boundary: Option<i32>,
     /// final bounds awaiting the debounced PTY winsize update.
     pending_pty_resize: Option<TerminalBounds>,
+    /// bounds of the last PTY winsize actually delivered, used to avoid duplicate sends.
+    last_pty_resize_sent: Option<TerminalBounds>,
     /// debounce timer for PTY winsize; dropping the task cancels it.
     pty_resize_task: Option<Task<()>>,
     #[cfg(any(test, feature = "test-support"))]
@@ -1644,7 +1648,7 @@ impl TaskStatus {
 const FIND_HYPERLINK_THROTTLE_PX: Pixels = px(5.0);
 const FIND_HYPERLINK_THROTTLE: Duration = Duration::from_millis(100);
 /// Delay before notifying the PTY of a new winsize after the last grid resize.
-const PTY_RESIZE_DEBOUNCE: Duration = Duration::from_millis(150);
+const PTY_RESIZE_DEBOUNCE: Duration = Duration::from_millis(50);
 
 /// Minimum pointer movement before a left click begins a selection. This keeps
 /// a click that jitters by a pixel or two (such as the window-focusing click)
@@ -2205,18 +2209,44 @@ impl Terminal {
     /// debounce PTY winsize updates
     /// SIGWINCH while the grid is still reflowing every frame, the grid itself is resized immediately
     fn schedule_pty_resize(&mut self, new_bounds: TerminalBounds, cx: &mut Context<Self>) {
-        self.pending_pty_resize = Some(new_bounds);
-        // drop the previous timer; a new frame restarts the debounce window.
-        self.pty_resize_task = None;
+        // Leading-edge throttle: the first resize in a burst is forwarded to
+        // the PTY immediately so TUIs/apps see the new size without waiting for
+        // the debounce, while subsequent resizes within the window are coalesced
+        // into a single trailing update with the final bounds.
+        let was_pending = self.pty_resize_task.is_some();
 
-        let this = cx.weak_entity();
-        self.pty_resize_task = Some(cx.spawn(async move |cx| {
+        if !was_pending {
+            if let TerminalType::Pty {
+                resources: PtyResources::Active(pty_tx),
+                ..
+            } = &self.terminal_type
+            {
+                pty_tx.resize(new_bounds);
+                #[cfg(any(test, feature = "test-support"))]
+                self.pty_resize_log.borrow_mut().push(new_bounds);
+            }
+            self.last_pty_resize_sent = Some(new_bounds);
+            self.pending_pty_resize = None;
+        } else {
+            // A resize is already in flight; just record the latest bounds so
+            // the trailing timer forwards the final size.
+            self.pending_pty_resize = Some(new_bounds);
+        }
+
+        // (Re)arm the trailing timer after every resize so it fires 50ms after
+        // the last activity; dropping the previous task cancels it.
+        self.pty_resize_task = None;
+        self.pty_resize_task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(PTY_RESIZE_DEBOUNCE).await;
-            this.update(cx, |terminal, cx| {
+            this.update(cx, |terminal, _cx| {
                 terminal.pty_resize_task = None;
                 let Some(bounds) = terminal.pending_pty_resize.take() else {
                     return;
                 };
+                // Avoid re-sending a size we already delivered on the leading edge.
+                if terminal.last_pty_resize_sent == Some(bounds) {
+                    return;
+                }
                 if let TerminalType::Pty {
                     resources: PtyResources::Active(pty_tx),
                     ..
@@ -2226,6 +2256,7 @@ impl Terminal {
                     #[cfg(any(test, feature = "test-support"))]
                     terminal.pty_resize_log.borrow_mut().push(bounds);
                 }
+                terminal.last_pty_resize_sent = Some(bounds);
             })
             .ok();
         }));
@@ -3201,6 +3232,7 @@ impl Terminal {
     pub fn release_pty_resources(&mut self) {
         self.pty_resize_task = None;
         self.pending_pty_resize = None;
+        self.last_pty_resize_sent = None;
         let TerminalType::Pty { resources, info } = &mut self.terminal_type else {
             return;
         };
@@ -3896,8 +3928,48 @@ mod tests {
             })
             .await
             .unwrap();
+
+
+
         cx.new(|cx| builder.subscribe(cx))
     }
+
+    /// Builds a PTY-backed task terminal inside a fresh test window, so that the
+    /// terminal can later be addressed through that window (`update_in`).
+    async fn build_test_terminal_with_window(cx: &mut TestAppContext) -> (Entity<Terminal>, &mut VisualTestContext) {
+        let builder = cx
+            .update(|cx| {
+                TerminalBuilder::new(
+                    None,
+                    TerminalMode::task(SpawnInTerminal {
+                        command: Some("sleep".to_owned()),
+                        args: vec!["30".to_string()],
+                        ..Default::default()
+                    }),
+                    task::Shell::WithArguments {
+                        program: "sleep".to_owned(),
+                        args: vec!["30".to_string()],
+                        title_override: None,
+                    },
+                    HashMap::default(),
+                    SettingsCursorShape::default(),
+                    AlternateScroll::On,
+                    None,
+                    vec![],
+                    Duration::ZERO,
+                    false,
+                    0,
+                    cx,
+                    vec![],
+                    PathStyle::local(),
+                )
+            })
+            .await
+            .unwrap();
+        let window = cx.add_empty_window();
+        (window.new(|cx| builder.subscribe(cx)), window)
+    }
+
 
     /// Builds a non-PTY (`no_pty`) task terminal, exercising the path used by
     /// headless hosts (e.g. the eval CLI) where PTY allocation fails with
@@ -6515,4 +6587,121 @@ mod tests {
         assert!(terminal.cwd_history.is_empty());
         assert_eq!(terminal.pending_cwd_boundary, None);
     }
+
+    #[gpui::test]
+    async fn test_pty_resize_is_debounced(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let (terminal, window) = build_test_terminal_with_window(cx).await;
+
+        let wide = TerminalBounds::new(
+            px(20.),
+            px(10.),
+            bounds(point(px(0.), px(0.)), size(px(400.), px(160.))),
+        );
+
+        // The grid resizes immediately and the first PTY winsize is delivered on
+        // the leading edge; a trailing update is only sent if bounds change again.
+        terminal.update_in(window, |terminal, window, cx| {
+            terminal.set_size(wide);
+            terminal.sync(window, cx);
+        });
+
+        let log = terminal.update(cx, |t, _| t.take_pty_resize_log());
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0], wide);
+
+        // Trailing timer fires without any newer pending bounds, so nothing
+        // extra is delivered to the child.
+        cx.executor().advance_clock(PTY_RESIZE_DEBOUNCE);
+        cx.run_until_parked();
+
+        let log = terminal.update(cx, |t, _| t.take_pty_resize_log());
+        assert!(log.is_empty());
+    }
+
+    #[gpui::test]
+    async fn test_pty_resize_coalesces_multiple_resizes(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let (terminal, window) = build_test_terminal_with_window(cx).await;
+
+        let wide = TerminalBounds::new(
+            px(20.),
+            px(10.),
+            bounds(point(px(0.), px(0.)), size(px(400.), px(160.))),
+        );
+        let narrow = TerminalBounds::new(
+            px(20.),
+            px(10.),
+            bounds(point(px(0.), px(0.)), size(px(50.), px(160.))),
+        );
+        let tall = TerminalBounds::new(
+            px(20.),
+            px(10.),
+            bounds(point(px(0.), px(0.)), size(px(400.), px(200.))),
+        );
+
+        // Several resizes inside the debounce window must coalesce into a
+        // single PTY winsize update with the final bounds.
+        terminal.update_in(window, |terminal, window, cx| {
+            terminal.set_size(wide);
+            terminal.sync(window, cx);
+            terminal.set_size(narrow);
+            terminal.sync(window, cx);
+            terminal.set_size(tall);
+            terminal.sync(window, cx);
+        });
+
+        // The first resize is delivered on the leading edge; the final bounds
+        // are delivered by the trailing timer.
+        let first = terminal.update(cx, |t, _| t.take_pty_resize_log());
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0], wide);
+
+        cx.executor().advance_clock(PTY_RESIZE_DEBOUNCE);
+        cx.run_until_parked();
+
+        let trailing = terminal.update(cx, |t, _| t.take_pty_resize_log());
+        assert_eq!(trailing.len(), 1);
+        assert_eq!(trailing[0], tall);
+    }
+
+    #[gpui::test]
+    async fn test_release_pty_resources_cancels_pending_pty_resize(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let (terminal, window) = build_test_terminal_with_window(cx).await;
+
+        let wide = TerminalBounds::new(
+            px(20.),
+            px(10.),
+            bounds(point(px(0.), px(0.)), size(px(400.), px(160.))),
+        );
+
+        terminal.update_in(window, |terminal, window, cx| {
+            terminal.set_size(wide);
+            terminal.sync(window, cx);
+        });
+
+        // The leading resize is delivered immediately, before release.
+        let first = terminal.update(cx, |t, _| t.take_pty_resize_log());
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0], wide);
+
+        // Releasing the PTY cancels the pending trailing resize, so no further
+        // winsize is delivered to the child even after the debounce elapses.
+        terminal.update(cx, |terminal, _cx| {
+            terminal.release_pty_resources();
+        });
+
+        cx.executor().advance_clock(PTY_RESIZE_DEBOUNCE);
+        cx.run_until_parked();
+
+        assert!(terminal
+            .update(cx, |t, _| t.take_pty_resize_log())
+            .is_empty());
+        assert_eq!(terminal.update(cx, |t, _| t.last_content.terminal_bounds), wide);
+    }
+
 }
